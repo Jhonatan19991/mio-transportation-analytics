@@ -1,4 +1,3 @@
-# Notebook: dlt_pipeline_gps.py
 import dlt
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
@@ -6,20 +5,18 @@ from pyspark.sql.window import Window
 import requests
 import pandas as pd
 
-# Constantes
 TZ = "America/Bogota"
 GPS_SCALE = 1e7
 EARTH_METERS = 6371000.0
 
 # -----------------------
-# BRONZE: ingesta raw
+# BRONZE: ingest raw
 # -----------------------
-# ---------- BRONZE corregido ----------
+# ---------- BRONZE  ----------
 @dlt.table(name="bronze_gps_raw", comment="Raw ingestion from workspace.default.gps_delta with normalized gps_data_parsed.")
 def bronze_gps_raw():
     raw = spark.table("workspace.default.gps_delta")  # usa la tabla exacta que tienes
 
-    # esquema esperado dentro del array (si viene como string JSON habrá que parsearlo)
     inner = T.StructType([
         T.StructField("BUSNUMBER", T.StringType(), True),
         T.StructField("DELAY", T.StringType(), True),
@@ -35,27 +32,20 @@ def bronze_gps_raw():
     ])
     expected_array_schema = T.ArrayType(T.StructType([T.StructField("element", inner, True)]), containsNull=True)
 
-    # Detectar tipo real de gps_data en la tabla
     gps_field = next((f for f in raw.schema.fields if f.name == "gps_data"), None)
     if gps_field is None:
-        # no existe la columna gps_data (muy raro) -> devolver raw con columna vacía
         df = raw.withColumn("gps_data_parsed", F.array())
     else:
         dt = gps_field.dataType
-        # Si es string => parsear JSON; si es array => reuse; si es otra cosa => intentar coerción segura
         if isinstance(dt, T.StringType) or type(dt).__name__ == "StringType":
             df = raw.withColumn("gps_data_parsed", F.from_json("gps_data", expected_array_schema))
         elif isinstance(dt, T.ArrayType):
-            # ya viene como array (tu caso): aseguramos que la columna exista como 'gps_data_parsed'
             df = raw.withColumn("gps_data_parsed", F.col("gps_data"))
         else:
-            # fallback: intentar parsear por si viene como string-like
             df = raw.withColumn("gps_data_parsed", F.when(F.col("gps_data").isNotNull(), F.col("gps_data")).otherwise(F.array()))
 
-    # mantener ingest_time para fallback de timestamps
     df = df.withColumn("ingest_time", F.current_timestamp())
 
-    # Expect básico sobre la columna normalizada (no usamos expect_or_drop aquí)
     dlt.expect("bronze_has_gps_data_parsed", F.col("gps_data_parsed").isNotNull())
 
     return df
@@ -63,36 +53,29 @@ def bronze_gps_raw():
 
 @dlt.table(name="bronze_paradas_raw", comment="Raw paradas. Se lee JSON público y se crea DataFrame.")
 def bronze_paradas_raw():
-    # URL pública con paradas (raw JSON). Cambia si lo necesitas.
     url_paradas = "https://raw.githubusercontent.com/Jhonatan19991/images/refs/heads/main/paradas.json"
     resp = requests.get(url_paradas)
     resp.raise_for_status()
     paradas_data = resp.json()
 
-    # crear DataFrame spark directamente desde la lista/dict del JSON
-    # si paradas_data es un dict principal con key 'paradas' adaptaremos:
     if isinstance(paradas_data, dict) and "paradas" in paradas_data and not isinstance(paradas_data["paradas"], list):
-        # si la estructura es inesperada, envolverla
         paradas_data = [paradas_data]
 
-    # convertir a pandas por compatibilidad y luego spark
     dt = pd.DataFrame(paradas_data)
     sp_df = spark.createDataFrame(dt)
     return sp_df
 
 
 # -----------------------
-# SILVER: limpieza y normalización
+# SILVER
 # -----------------------
-# ---------- SILVER corregido ----------
+# ---------- SILVER  ----------
 @dlt.table(name="silver_gps_flat", comment="GPS flatten + types cast + timestamp normalizado.")
 def silver_gps_flat():
     src = dlt.read("bronze_gps_raw")
 
-    # Aplico la expectativa sobre la fuente (antes de eliminar gps_data_parsed)
     dlt.expect("valid_gps_array", F.col("gps_data_parsed").isNotNull() & (F.size(F.col("gps_data_parsed")) > 0))
 
-    # Determinar columna timestamp (tu table tiene 'timestamp' double, si no, usar ingest_time)
     timestamp_col = "timestamp" if "timestamp" in [f.name for f in src.schema.fields] else "ingest_time"
 
     df = (
@@ -111,7 +94,6 @@ def silver_gps_flat():
             F.col("item.element.TASKID").alias("TASKID"),
             F.col("item.element.TELEGRAMDATE").alias("TELEGRAMDATE"),
             F.col("item.element.TRIPID").alias("TRIPID"),
-            # convertir epoch double->timestamp (tu 'timestamp' es double en la tabla)
             F.to_timestamp(F.from_unixtime(F.col("raw_timestamp").cast("long"))).alias("timestamp_utc")
         )
         .withColumn("timestamp", F.from_utc_timestamp("timestamp_utc", TZ))
@@ -135,9 +117,7 @@ def silver_gps_flat():
 def silver_paradas_exploded():
     src = dlt.read("bronze_paradas_raw")
 
-    # Validar que la columna 'paradas' exista
     if "paradas" not in [f.name for f in src.schema.fields]:
-        # si la estructura es distinta (ej: root array), devolver la tabla tal cual
         return src
 
     paradas_field = next((f for f in src.schema.fields if f.name == "paradas"), None)
@@ -146,11 +126,9 @@ def silver_paradas_exploded():
         elem_type = paradas_field.dataType.elementType
 
     if isinstance(elem_type, T.StructType):
-        # Caso ideal: paradas es Array[Struct] -> expandir con element.*
         df = src.withColumn("element", F.explode(F.col("paradas"))).select("element.*", "ruta")
         return df
     else:
-        # Fallback: explotar y tomar keys esperados desde mapa o struct irregular
         exploded = src.withColumn("element", F.explode(F.col("paradas")))
         expected_cols = [
             "DECIMALLATITUDE", "DECIMALLONGITUDE", "DESCRIPTION", "LINE", "LINEID", "LINEVA",
@@ -158,7 +136,6 @@ def silver_paradas_exploded():
         ]
         selected = []
         for c in expected_cols:
-            # element puede ser MapType o StructType disfrazado; usamos getItem para seguridad
             selected.append(F.col("element").getItem(c).alias(c))
         selected.append("ruta")
         df = exploded.select(*selected)
@@ -187,7 +164,7 @@ def silver_routes_meta():
 
 
 # -----------------------
-# SILVER -> JOIN y cálculos espaciales/temporales
+# SILVER 
 # -----------------------
 
 @dlt.table(name="silver_gps_enriched", comment="GPS unido con stops + cálculos de distancia (haversine) y velocidades.")
@@ -196,23 +173,19 @@ def silver_gps_enriched():
     gps = dlt.read("silver_gps_flat")
     stops = dlt.read("silver_stops_routes")
 
-    # Renombrar STOPID de stops para evitar duplicados al hacer el join
     stops_sel = stops.select(
-        F.col("STOPID").alias("STOPID_stop"),  # evita colisión con gps.STOPID
+        F.col("STOPID").alias("STOPID_stop"),  
         F.col("LINE"),
         F.col("ORIENTATION"),
-        F.col("row_number")  # mantenemos el nombre porque lo usamos más adelante
+        F.col("row_number")  
     )
 
-    # Join evitando colisiones de nombres
     df = gps.join(
         stops_sel,
         (gps.STOPID == stops_sel.STOPID_stop) & (gps.RUTA == stops_sel.LINE),
         how="left"
     )
 
-    # Ahora la columna ORIENTATION viene de stops (si no hay match será null)
-    # Ventana por viaje (usa ORIENTATION que ahora existe en el dataframe)
     w = Window.partitionBy("BUSNUMBER", "RUTA", "TRIPID", "date", "ORIENTATION").orderBy("timestamp")
 
     df = df.withColumn("prev_rownum", F.lag("row_number").over(w)) \
@@ -222,7 +195,6 @@ def silver_gps_enriched():
            .withColumn("LASTLATITUDE", F.lag("GPSY").over(w)) \
            .withColumn("LASTLONGITUDE", F.lag("GPSX").over(w))
 
-    # haversine (vectorizado)
     df = df.withColumn("dlat", F.radians(F.col("GPSY") - F.col("LASTLATITUDE"))) \
            .withColumn("dlon", F.radians(F.col("GPSX") - F.col("LASTLONGITUDE")))
 
@@ -242,7 +214,6 @@ def silver_gps_enriched():
         ).otherwise(None)
     ).drop("dlat", "dlon")
 
-    # tiempos y velocidad protegida
     df = df.withColumn("time_s", (F.unix_timestamp("next_time") - F.unix_timestamp("prev_time")))
     df = df.withColumn("VELOCITY", F.when(F.col("time_s") > 0, F.round(F.col("haversine_dist") / F.col("time_s"), 2)).otherwise(None))
     df = df.withColumn("AVGVELOCITY", F.round(F.avg("VELOCITY").over(w), 2))
@@ -251,7 +222,7 @@ def silver_gps_enriched():
 
 
 # -----------------------
-# GOLD: detección de trips y tabla final
+# GOLD
 # -----------------------
 @dlt.table(name="gold_trips_candidates", comment="Tabla intermedia con inicio/fin candidato de cada TRIPID.")
 def gold_trips_candidates():
@@ -344,14 +315,12 @@ def gold_trips_final():
 def gold_route_segment_speed():
     enriched = dlt.read("silver_gps_enriched")
 
-    # ventana por viaje para obtener next row_number en la secuencia
     w = Window.partitionBy("BUSNUMBER", "TRIPID", "date", "RUTA", "ORIENTATION").orderBy("timestamp")
     seg = (enriched
            .withColumn("next_row", F.lead("row_number").over(w))
            .withColumn("segment_start", F.col("row_number"))
            .withColumn("segment_end", F.col("next_row"))
            .filter(F.col("segment_start").isNotNull() & F.col("segment_end").isNotNull() & (F.col("segment_end") == F.col("segment_start") + 1))
-           # cada fila corresponde al punto de inicio del segmento; agregamos velocidades/distancias observadas
           )
 
     agg = (seg.groupBy("RUTA", "ORIENTATION", "segment_start", "segment_end", "date")
