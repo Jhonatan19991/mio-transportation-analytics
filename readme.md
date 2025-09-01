@@ -2,6 +2,10 @@
 
 A comprehensive data engineering project that extracts, processes, and analyzes GPS data from MIO (Massive Integrated Transportation System) in Cali, Colombia. This project combines Azure Functions for data extraction with Databricks Delta Live Tables (DLT) for automated data processing and analytics.
 
+## Workflow
+
+![image](https://raw.githubusercontent.com/Jhonatan19991/images/refs/heads/main/MIO_img/Diagrama.png)
+
 ## 🚀 Project Overview
 
 This project creates an end-to-end data pipeline that:
